@@ -3,11 +3,11 @@
 MacBook keyboard and screen backlight adjust on the ambient light.
 Internally, macbook-lighter reads the following files:
 
-* /sys/devices/platform/applesmc.768/light
-* /sys/class/backlight/intel_backlight/brightness
-* /sys/class/backlight/intel_backlight/max_brightness
-* /sys/class/leds/smc::kbd_backlight/brightness
-* /sys/class/leds/smc::kbd_backlight/max_brightness
+* /sys/bus/iio/devices/iio:device0/in_intensity_both_input
+* /sys/class/backlight/acpi_video0/brightness
+* /sys/class/backlight/acpi_video0/max_brightness
+* /sys/class/leds/apple::kbd_backlight/brightness
+* /sys/class/leds/apple::kbd_backlight/max_brightness
 
 So you're expected to install corresponding Nvidia/Intel drivers first.
 
@@ -52,5 +52,4 @@ macbook-lighter-ambient
 
 ## Tested MacBook Versions
 
-* MacBook Pro Late 2013 (11,1)
-* Macbook Air 2012
+* MacBook Pro 2019 (16,1)
