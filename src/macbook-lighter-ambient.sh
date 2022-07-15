@@ -1,221 +1,144 @@
-#!/usr/bin/env bash
+#!/bin/env bash
+# Adjust the monitor's brightness based on information from the ambient light sensor (ALS)
+#
+# Tested only on a Macbook Pro 16,1. No idea how well it'll work on other systems.
+# I assume no responsibility if this script unleashes gremlins and bricks
+# your device. Use at your own risk.
+#
+# TODO: Add multi-monitor support
 
-tmpfile=$(mktemp /tmp/macbook-lighter-ambient.XXXXXX)
-trap "rm -f /tmp/macbook-lighter-ambient*; exit" EXIT INT
-intel_dir=/sys/class/backlight/acpi_video0
-kbd_dir=/sys/class/leds/apple::kbd_backlight
+# Feel free to changes these as needed
+MONITOR=acpi_video0
+SENSOR=iio:device0
+KBD=apple::kbd_backlight
+ADAPTER=ADP1
 
-power_file=/sys/class/power_supply/ADP1/online
-screen_file=$intel_dir/brightness
-kbd_file=$kbd_dir/brightness
-lid_file=/proc/acpi/button/lid/LID0/state
-light_file="/sys/bus/iio/devices/iio:device0/in_intensity_both_input"
-#/sys/devices/platform/applesmc.768/light"
+BACKLIGHT_DIR="/sys/class/backlight/$MONITOR"
+BRI_FILE="${BACKLIGHT_DIR}/brightness"
+KBD_BACKLIGHT_DIR="/sys/class/leds/$KBD"
+KBD_BRI_FILE="${KBD_BACKLIGHT_DIR}/brightness"
 
-#####################################################
-# wait drivers loaded
+MAX_BRI=$(cat "${BACKLIGHT_DIR}/max_brightness")
+KBD_MAX_BRI=$(cat "${KBD_BACKLIGHT_DIR}/max_brightness")
 
-$ML_DEBUG && echo checking $intel_dir and $kbd_dir...
-while [ ! -d $intel_dir -o ! -d $kbd_dir ]; do
-        sleep 1
-done
-screen_max=$(cat $intel_dir/max_brightness)
-kbd_max=$(cat $kbd_dir/max_brightness)
-screen_cur=$(cat $screen_file)
-kbd_cur=$(cat $kbd_file)
-#####################################################
+PLUG_STATUS_OLD=$(cat /sys/class/power_supply/$ADAPTER/online)
+
+
+#######################################
 # Settings
-[ -f /etc/macbook-lighter.conf ] && source /etc/macbook-lighter.conf
-ML_DURATION=${ML_DURATION:-1.5}
-ML_FRAME=${ML_FRAME:-0.02}
-ML_INTERVAL=${ML_INTERVAL:-3}
-ML_BRIGHT_ENOUGH=${ML_BRIGHT_ENOUGH:-80000}
-ML_SCREEN_THRESHOLD=${ML_SCREEN_THRESHOLD:-5}
-ML_SCREEN_MIN_BRIGHT=${ML_SCREEN_MIN_BRIGHT:-12}
-ML_KBD_BRIGHT=${ML_KBD_BRIGHT:-60}
-ML_BATTERY_DIM=${ML_BATTERY_DIM:-0.2}
-ML_AUTO_KBD=${ML_AUTO_KBD:-true}
-ML_AUTO_SCREEN=${ML_AUTO_SCREEN:-true}
-ML_DEBUG=${ML_DEBUG:-false}
-ML_SETX=${ML_SETX:-false}
-#####################################################
-$ML_SETX && set -x
-# Private States
-screen_ajusted_at=0
-kbd_ajusted_at=0
+[ -f /etc/autolight.conf ] && source /etc/autolight.conf
+POLLING_PER=${POLLING_PER:-3}
+ML_FRAME=${ML_FRAME:-0.01}
+MIN_LUX=${MIX_LUX:-1000}
+MAX_LUX=${MAX_LUX:-80000}
+MIN_BRI=${MIX_BRI:-12}
+BRI_THRESHOLD_FRAC=${BRI_THRESHOLD_FRAC:-0.1}
+BRI_UNPLUGGED_MODIFIER=${BRI_UNPLUGGED_MODIFIER:-0.8}
+DEBUG=${DEBUG:-false}
+SETX=${SETX:-false}
 
-function get_light {
-        val=$(cat $light_file)   # eg. (41,0)
-#   val=${val:1:-3}     # eg. 41
-        val=$(($val > $ML_BRIGHT_ENOUGH ? $ML_BRIGHT_ENOUGH : $val))
-        val=$(($val == 0 ? 1 : $val))
-        echo $val
-}
+$SETX && set -x
+if $DEBUG; then
+	for i in POLLING_PER ML_FRAME MIN_LUX MAX_LUX MIN_BRI BRI_THRESHOLD_FRAC BRI_UNPLUGGED_MODIFIER DEBUG SETX; do [ -f /etc/autolight.conf ] && cat /etc/autolight.conf | grep "$i" | grep -v "^\#" | sed -z 's~\n~ ~g'; echo ${!i}; done
+fi
+#$DEBUG && echo $POLLING_PER
+## stdbuf -o 1M pee "cat" "cat | cut -d '=' - -f1 | xargs -I R echo \"\$R\""
+## tee >(echo ;expr1=$(echo -ne "$(cut -d '=' - -f1)"); for i in $(echo "$expr1"); do echo ${!i}; done) && echo
+#######################################
+#######################################
+# Adjust brightness based on lux value
+# GLOBALS:
+#   MIN_LUX, MAX_LUX, MIN_BRI, MAX_BRI,
+#   BRI_THRESHOLD_FRAC, BRI_UNPLUGGED_MODIFIER,
+#   BRI_FILE, PLUG_STATUS_OLD, AMBI_BRI_OLD
+# ARGUMENTS:
+#   Lux value
+# OUTPUTS:
+#   Write new brightness to BRI_FILE
+# RETURN:
+#   0 if print succeeds, non-zero on error
+#######################################
+if [[ $POLLING_PER == 0 ]]; then
+    SENSOR_FREQ=$(cat /sys/bus/iio/devices/$SENSOR/in_illuminance_sampling_frequency)
+    POLLING_PER=$(echo "1/$SENSOR_FREQ" | bc)
+fi
 
-function transition {
-        from=$1
-        to=$2
-        dev=$3
-        $ML_DEBUG && echo "transition $dev from $from to $to"
-        length=$(echo "$from - $to" | bc)
-        steps=$(echo "$ML_DURATION / $ML_FRAME" | bc)
-        $ML_DEBUG && echo "----- length: $length ; ML_DURATION: $ML_DURATION ML_FRAME: $ML_FRAME ; steps: $steps"
-        $ML_SETX && set +x
-        for ((step=1; step<=$steps; step++)); do
-                result=$(echo "($to - $from) * $step / $steps + $from" | bc)
-                echo "$result" > "$dev"
+change-bri() {
+	d_from=$1; d_to=$2; k_from=$3; k_to=$4
+	length_d=$(echo "$d_from - $d_to" | bc)
+	length_k=$(echo "$k_from - $k_to" | bc)
+	steps=$(echo "$POLLING_PER / $ML_FRAME / 2" | bc)
+
+	$DEBUG && echo -e "\nlength_d: $length_d\tlength_k: $length_k\tsteps: $steps"
+	$SETX && set +x
+	$DEBUG && TS1=$(date +%s.%3N)
+	for ((step=1; step<=$steps; step++)); do
+                d_res=$(echo "($d_to - $d_from) * $step / $steps + $d_from" | bc) && k_res=$(echo "($k_to - $k_from) * $step / $steps + $k_from" | bc)
+                echo "$d_res" > "$BRI_FILE" &
+		echo "$k_res" > "$KBD_BRI_FILE" &
         done
-        $ML_SETX && set -x
+	$DEBUG && TS2=$(date +%s.%3N)
+	$DEBUG && TSALL=$(printf "%.5f" $(echo "($TS2-$TS1)*1000" | bc))
+	$SETX && set -x
+	$DEBUG && echo "$TSALL ms"
 }
 
-function screen_range {
-        screen_to=$1
-        if (( screen_to < ML_SCREEN_MIN_BRIGHT )); then
-                echo $ML_SCREEN_MIN_BRIGHT
-        elif (( screen_to > screen_max )); then
-                echo $screen_max
-        else
-                echo $screen_to
-        fi
+change_brightness() {
+    lux=$1
+
+    # Ensure the lux value is within range.
+    [[ $lux -lt $MIN_LUX ]] && lux=$MIN_LUX
+    [[ $lux -gt $MAX_LUX ]] && lux=$MAX_LUX
+
+    # Percentages are in logspace since humans see logarithmically
+    ambi_bri_frac=$(echo "(l($lux)-l($MIN_LUX))/(l($MAX_LUX)-l($MIN_LUX))" | bc -l)
+
+	if $DEBUG; then
+		luxpr=$(printf "%.5f" $(echo "l($lux)" | bc -l))
+		min_luxpr=$(printf "%.5f" $(echo "l($MIN_LUX)" | bc -l))
+		max_luxpr=$(printf "%.5f" $(echo "l($MAX_LUX)" | bc -l))
+		echo -e "lux: $luxpr\nmin_lux: $min_luxpr\nmax_lux: $max_luxpr\nambi_bri_frac_old: ($luxpr-$min_luxpr)/($max_luxpr-$min_luxpr) $(printf "%.5f" $(echo "(l($lux)-l($MIN_LUX))/(l($MAX_LUX)-l($MIN_LUX))" | bc -l))"
+		echo "ambi_bri_frac: $(printf "%.3f" $(echo " $lux / $MAX_LUX" | bc -l))"
+	fi
+
+    plug_status=$(cat /sys/class/power_supply/$ADAPTER/online)
+    [[ $plug_status -eq 0 ]] && ambi_bri_frac=$(echo "$ambi_bri_frac*$BRI_UNPLUGGED_MODIFIER" | bc -l) || ambi_bri_frac=$(echo "$ambi_bri_frac*1.2" | bc -l)
+
+    ambi_bri_frac_old=$(echo "(l($(cat $BRI_FILE))-l($MIN_BRI))/(l($MAX_BRI)-l($MIN_BRI))" | bc -l)
+    frac_diff=$(echo "$ambi_bri_frac-$ambi_bri_frac_old" | bc)
+
+	$DEBUG && echo "frac_diff: $(printf "%.5f" $frac_diff)"
+    # Only change the brightness if the threshhold has been reached or if the computer was plugged/unplugged
+    (( $(echo "${frac_diff#-} > $BRI_THRESHOLD_FRAC" | bc) )) && change_bri=true || change_bri=false
+    [[ $plug_status -ne $PLUG_STATUS_OLD ]] && change_bri=true
+
+    ambi_bri_float=$(echo "$MAX_BRI*$ambi_bri_frac" | bc -l)
+
+	$DEBUG && echo -e "\nambi_bri_float: $(printf "%.5f" $ambi_bri_float)"
+    ambi_bri=$(echo "scale=0;($ambi_bri_float+0.5)/1" | bc)
+
+    [[ $ambi_bri -le $MIN_BRI ]] && ambi_bri=$MIN_BRI
+    [[ $ambi_bri -ge $MAX_BRI ]] && ambi_bri=$MAX_BRI
+	$DEBUG && echo "ambi_bri: $ambi_bri"
+
+	if [[ $plug_status -eq 0 ]]; then
+		kbd_bri_float=$(echo "(1-$ambi_bri_frac/$BRI_UNPLUGGED_MODIFIER)*$KBD_MAX_BRI*$BRI_UNPLUGGED_MODIFIER/2" | bc -l)
+		$DEBUG && echo -e "\ncoef: (1-($(printf "%.0f" $ambi_bri_frac)/$BRI_UNPLUGGED_MODIFIER)*$BRI_UNPLUGGED_MODIFIER/2 $(printf "%.5f" $(echo "(1-$ambi_bri_frac/$BRI_UNPLUGGED_MODIFIER)*$BRI_UNPLUGGED_MODIFIER/2" | bc -l))\nkbd_bri: $(printf "%.5f" $kbd_bri_float)"
+	else
+		kbd_bri_float=$(echo "(1-$ambi_bri_frac/1.2)*$KBD_MAX_BRI" | bc -l)
+		$DEBUG && echo -e "\ncoef: (1-$(printf "%.5f" $ambi_bri_frac))/1.2 $(printf "%.5f" $(echo "(1-$ambi_bri_frac/1.2)" | bc -l))\nkbd_bri: $(printf "%.5f" $kbd_bri_float)"
+	fi
+	kbd_bri=$(printf "%.0f" $kbd_bri_float)
+	$DEBUG && echo "kbd_bri: $kbd_bri"
+	[ "$kbd_bri" -ne "$(cat $KBD_BRI_FILE)" ] && change_bri=true
+	$change_bri && change-bri $(cat $BRI_FILE) $ambi_bri $(cat $KBD_BRI_FILE) $kbd_bri &
+
+    PLUG_STATUS_OLD=$plug_status
 }
 
-function kbd_range {
-        kbd_to=$1
-        screen_cur=$(cat $tmpfile | sed -n 1p | cut -d '/' -f2)
-        if [ "$screen_cur" -le "$ML_SCREEN_MIN_BRIGHT" ]; then
-                echo $kbd_max
-        elif [ "$screen_cur" -ge "$screen_max" ]; then
-                echo "0"
-        else
-                if [ "$kbd_to" -le 0 ]; then
-                        echo "0"
-                elif [ "$kbd_to" -ge "$kbd_max" ]; then
-                        echo ${kbd_max}
-                else
-                        echo ${kbd_to}
-                fi
-        fi
-}
-
-function update_screen {
-        light=$1
-        screen_from=$(cat $screen_file)
-        screen_to=$(echo "1.4 * $coef * $screen_max * $light / $ML_BRIGHT_ENOUGH" | bc)
-        screen_to=$(screen_range $screen_to)
-
-        echo "$screen_from/$screen_to" > "$tmpfile"
-
-        if (( screen_to - screen_from > -ML_SCREEN_THRESHOLD && screen_to - screen_from < ML_SCREEN_THRESHOLD )); then
-                $ML_DEBUG && echo "screen threshold not reached(${screen_from}->${screen_to}), skip update" && echo
-                return
-        fi
-        screen_ajusted_at=$light
-        transition $screen_from $screen_to $screen_file
-}
-
-function update_kbd {
-        light=$1
-        kbd_from=$(cat $kbd_file)
-        $ML_DEBUG && echo -n "update_kbd kbd_from: $kbd_cur "
-
-        kbd_to=$(echo "$kbd_max - ($coef_kbd * $kbd_max * $light / $ML_BRIGHT_ENOUGH)" | bc)
-        kbd_to=$(kbd_range $kbd_to)
-        $ML_DEBUG && echo "kbd_to(2): $kbd_to"
-
-        if [ "$ML_DEBUG" == "true" ];then
-                kbd_test_to=$(echo "$kbd_max - ($coef_kbd * $kbd_max * $light / $ML_BRIGHT_ENOUGH)" | bc -l )
-                kbd_test_to=$(printf "%.3f" $kbd_test_to)
-                echo "kbd fnc: $kbd_test_to"
-        fi
-
-        echo "$kbd_from/$kbd_to" >> "$tmpfile"
-
-        $ML_DEBUG &&  echo "kbd_from->to: $kbd_from -> $kbd_to"
-        if [ "$kbd_from" == "$kbd_to" ]; then
-                $ML_DEBUG && echo "kbd threshold not reached ${kbd_from}->${kbd_to} , skip update" && echo
-                return
-        fi
-        kbd_ajusted_at=$light
-        transition $kbd_from $kbd_to $kbd_file
-}
-
-function update {
-        $ML_DEBUG && echo updating
-        lid=$(awk '{print $2}' $lid_file)
-        if [ "$lid" == "closed" ]; then
-                $ML_DEBUG && echo lid closed, skip update
-                return
-        fi
-
-        light=$(get_light)
-        $ML_DEBUG && echo
-
-  if [ $ML_AUTO_SCREEN ] && [ $ML_AUTO_KBD ]; then
-#               $ML_DEBUG && echo "ML_AUTO_SCREEN and ML_AUTO_KBD are true, running in parallel"
-                update_screen $light &
-                update_kbd $light &
-                wait
-  else
-                $ML_AUTO_SCREEN && update_screen $light
-                $ML_AUTO_KBD && update_kbd $light
-        fi
-  $ML_DEBUG && echo
-        $ML_DEBUG && echo "light: ${light}      coef: $coef     coef_kbd: $coef_kbd     br_eno: $ML_BRIGHT_ENOUGH"
-        $ML_DEBUG && echo "screen from/to/max $(cat $tmpfile | sed -n 1p)/${screen_max}"
-        $ML_DEBUG && echo "keyboard from/to/max $(cat $tmpfile | sed -n 2p)/${kbd_max}"
-        $ML_DEBUG && echo
-}
-
-function watch {
-        $ML_DEBUG && echo watching light change...
-        while true; do
-                update
-                sleep $ML_INTERVAL
-        done
-}
-
-function power_coef {
-        power=$(cat $power_file)
-        if [ "$power" == 0 ]; then
-                echo "1 - $ML_BATTERY_DIM" | bc
-        else
-                echo 1
-        fi
-}
-
-function init {
-        $ML_DEBUG && echo initializing backlights... && echo
-
-        light=$(get_light)
-
-        screen_ajusted_at=$light
-        kbd_ajusted_at=$light
-        coef=$(power_coef)
-        coef_kbd=$(echo "2 - $coef" | bc)
-
-        if (( light >= ML_BRIGHT_ENOUGH )); then
-                screen_to=$screen_max
-                kbd_to=0
-        else
-                screen_to=$(echo "1.4 * $coef * $screen_max * $light / $ML_BRIGHT_ENOUGH" | bc)
-                screen_to=$(screen_range $screen_to)
-                kbd_to=$(echo "$kbd_max - ($coef_kbd * $kbd_max * $light / $ML_BRIGHT_ENOUGH)" | bc)
-                kbd_to=$(kbd_range $kbd_to)
-        fi
-
-        screen_from=$(cat $screen_file)
-        kbd_from=$(cat $kbd_file)
-
-        if [ $ML_AUTO_SCREEN ] && [ $ML_AUTO_KBD ]; then
-#               $ML_DEBUG && echo "ML_AUTO_SCREEN and ML_AUTO_KBD are true, running in parallel"
-                transition $screen_from $screen_to $screen_file &
-                transition $kbd_from $kbd_to $kbd_file &
-                wait
-        else
-                $ML_AUTO_SCREEN && transition $screen_from $screen_to $screen_file
-                $ML_AUTO_KBD && transition $kbd_from $kbd_to $kbd_file
-        fi
-}
-
-init
-watch
+while true; do
+	grep -q closed /proc/acpi/button/lid/LID0/state && continue
+	lux=$(cat /sys/bus/iio/devices/$SENSOR/in_illuminance_input)
+	change_brightness "$lux"
+	sleep $POLLING_PER
+done
